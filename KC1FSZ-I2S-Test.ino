@@ -297,6 +297,9 @@ void tryWrite() {
       // Create the phase pointer based on the target frequency
       unsigned int ph = GetPhase(PhaseCounter,2000);
       LastR = ph;
+      if (ph > 255) {
+        Serial.println("XXXX");
+      }
       // Convert the pointer to sin(phase)
       //LastS = SineWithQuadrant(ph);
       /*
