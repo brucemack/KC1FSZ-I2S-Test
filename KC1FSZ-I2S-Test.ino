@@ -9,12 +9,13 @@
 // https://www.nxp.com/docs/en/reference-manual/K20P64M72SF1RM.pdf
 //
 #include <Audio.h>
-//#include <Wire.h>
-//#include <SPI.h>
-//#include <SD.h>
-//#include <SerialFlash.h>
+#include <Wire.h>
+#include <SPI.h>
+#include <SD.h>
+#include <SerialFlash.h>
 
 AudioControlSGTL5000  sgtl5000_1;
+
 // This is the largest magnitude that can be represented by the DAC
 const float FullScale = (2 ^ 31) - 1;
 
@@ -82,14 +83,6 @@ unsigned int GetPhase(unsigned int counter,unsigned int freqHz) {
   return i;
 }
 
-/*
-  // Scale the phase accumulators to the size of the LUT phase range.  Note
-  // that we mutiply before dividing to avoid precision issues
-  unsigned long plPhaseScaled = (plPhaseAccumulator * phaseRange) / sampleFreq;
-  // Do the trig to get the amplitudes (-1 to +1)
-  float plAmp = sinWithQuadrant(plPhaseScaled,sinLut,phaseRange);
-*/
-
 // Clocking calculation for 8K (AK4556)
 //
 //   96 MHz system clock
@@ -148,14 +141,16 @@ if (window) apply_window_to_fft_buffer(buffer, window);
 
 void setup() {
 
-  BuildLut();
-
-  //arm_cfft_radix4_instance_q15 fft_inst;
-  //AudioMemory(10);
-
   Serial.begin(9600);
   delay(100);
   Serial.println("KC1FSZ");
+
+  BuildLut();
+  
+  Serial.println("Complete");
+
+  //arm_cfft_radix4_instance_q15 fft_inst;
+  AudioMemory(10);
 
   sgtl5000_1.enable();
   sgtl5000_1.volume(1.0);
@@ -286,6 +281,7 @@ volatile bool isRightWrite = false;
 volatile int maxSize = 0;
 volatile int counter = 0;
 
+volatile int LastR = 0;
 volatile float LastS = 0;
 volatile float LastT = 0;
 volatile int LastU = 0;
@@ -300,13 +296,18 @@ void tryWrite() {
       PhaseCounter++;
       // Create the phase pointer based on the target frequency
       unsigned int ph = GetPhase(PhaseCounter,2000);
-      // Cconvert the pointer to sin(phase)
-      LastS = SineWithQuadrant(ph);
+      LastR = ph;
+      // Convert the pointer to sin(phase)
+      //LastS = SineWithQuadrant(ph);
+      /*
       // Scale up to the DAC range (signed)
       LastT = LastS * FullScale;
       // Convert to integer (signed)
       LastU = (int)LastT;
       I2S0_TDR0 = (int)LastU;
+      */
+      counter += (1024 * 1024);
+      I2S0_TDR0 = counter; 
       isRightWrite = true;
     } else {
       counter += (1024 * 1024);
@@ -354,6 +355,8 @@ void loop() {
   if (millis() - lastDisplay > 2000) {
     lastDisplay = millis();
     Serial.print(counter);
+    Serial.print(" ");
+    Serial.print(LastR);
     Serial.print(" ");
     Serial.print(LastS);
     Serial.print(" ");
