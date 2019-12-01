@@ -8,7 +8,16 @@
 // Here is the K20 reference manual:
 // https://www.nxp.com/docs/en/reference-manual/K20P64M72SF1RM.pdf
 //
-#include <CircularBuffer.h>
+//#include <CircularBuffer.h>
+
+#include <Audio.h>
+#include <Wire.h>
+#include <SPI.h>
+#include <SD.h>
+#include <SerialFlash.h>
+
+AudioControlSGTL5000  sgtl5000_1;
+
 
 // Clocking calculation for 8K (AK4556)
 //
@@ -69,10 +78,14 @@ if (window) apply_window_to_fft_buffer(buffer, window);
 void setup() {
 
   //arm_cfft_radix4_instance_q15 fft_inst;
+  AudioMemory(10);
 
   Serial.begin(9600);
   delay(100);
   Serial.println("KC1FSZ");
+
+  sgtl5000_1.enable();
+  sgtl5000_1.volume(1.0);
 
   // Configure the Teensy 3.2 pins per the reference and wiring
   PORTC_PCR3 = PORT_PCR_MUX(6); // Alt 6 is BLCK - T3.2 pin 9
@@ -85,7 +98,7 @@ void setup() {
   SIM_SCGC6 |= SIM_SCGC6_I2S;
   // The MCLK is sourced from the system clock(0) or PLL(3) | The MCLK is enabled
   // QUESTION: IT LOOKS lIKE THE PJS CODE USES PLL >20MHz
-  I2S0_MCR = I2S_MCR_MICS(3) | I2S_MCR_MOE;
+  I2S0_MCR = I2S_MCR_MICS(0) | I2S_MCR_MOE;
   // Loop waiting for the divisor update to complete
   while (I2S0_MCR & I2S_MCR_DUF) ;
   // Divide down the system clock to get the MCLK
@@ -96,7 +109,7 @@ void setup() {
   I2S0_TMR = 0;
   // Set the high water mark for the FIFO.  This determines when the interupt
   // needs to fire.
-  I2S0_TCR1 = I2S_TCR1_TFW(1);
+  I2S0_TCR1 = I2S_TCR1_TFW(4);
   // Asynchronous mode | Bit Clock Active Low | Master Clock 1 Selected |
   // Bit Clock generated internally (master) | Bit Clock Divide
   // Setting DIV=1 means (1+1)*2=4 division of MCLK->BCLK
@@ -117,7 +130,7 @@ void setup() {
   I2S0_RMR = 0;
   // Set the high water mark for the FIFO.  This determines when the interupt
   // needs to fire.
-  I2S0_RCR1 = I2S_RCR1_RFW(1);
+  I2S0_RCR1 = I2S_RCR1_RFW(4);
   // Synchronous with transmitter | Bit Clock Active Low | Master Clock 1 Selected |
   // Bit Clock generated internally (master) | Bit Clock Divide
   // Setting DIV=1 means (1+1)*2=4 division of MCLK->BCLK
@@ -210,10 +223,12 @@ void tryWrite() {
   // Loop
   while (!isTXFIFOFull()) {
     if (!isRightWrite) {
-      I2S0_TDR0 = 0xf0f0f0f0;
+      counter += (1024 * 1024);
+      I2S0_TDR0 = counter;
       isRightWrite = true;
     } else {
-      I2S0_TDR0 = 0x0f0f0f0f;        
+      counter += (1024 * 1024);
+      I2S0_TDR0 = counter; 
       isRightWrite = false;
     }
   }
@@ -254,13 +269,8 @@ void i2s0_rx_isr(void) {
 long lastDisplay = 0;
 
 void loop() {
-/*
   if (millis() - lastDisplay > 2000) {
     lastDisplay = millis();
-    //Serial.print(leftBuf.pop());
-    //Serial.print(" ");
-    //Serial.println(rightBuf.pop());
-    Serial.println(maxSize);
+    Serial.println(counter);
   }
-*/
 }
