@@ -8,9 +8,9 @@
 // Here is the K20 reference manual:
 // https://www.nxp.com/docs/en/reference-manual/K20P64M72SF1RM.pdf
 //
-//
-//
-// Clocking calculation (AK4556)
+#include <CircularBuffer.h>
+
+// Clocking calculation for 8K (AK4556)
 //
 //   96 MHz system clock
 //   9/423 multiply/divide
@@ -20,15 +20,58 @@
 //   There are 24x2 bits in a frame (L+R)
 //   Fs is 7,978 Hz 
 //
-#include <CircularBuffer.h>
+//#define MCLK_MULT 9
+//#define MCLK_DIVIDE 423
+//
+// Clocking calculations for 44.1K:
+//
+// MCLK needs to 256 * 44.100 kHz sample rate = 11.2896 MHz
+// This is given by (CPU frequency * MCLK_MULT) / MCLK_DIV
+// MCLK_MULT is a positive integer with range 1-256 (8 bits)
+// MCLK_DIV is a positive integer with range 1-4096 (12 bits)
+// MCLK_MULT must be <= MCLK_DIV
+//
+#define MCLK_MULT 8
+#define MCLK_DIVIDE 51
 
-#define MCLK_FRACT 9
-#define MCLK_DIVIDE 423
+//#include <arm_math.h>
+
+/*
+int16_t buffer[512] __attribute__ ((aligned (4)));
+
+if (window) apply_window_to_fft_buffer(buffer, window);
+  arm_cfft_radix4_q15(&fft_inst, buffer);
+  // G. Heinzel's paper says we're supposed to average the magnitude
+  // squared, then do the square root at the end.
+  if (count == 0) {
+    for (int i=0; i < 128; i++) {
+      uint32_t tmp = *((uint32_t *)buffer + i);
+      uint32_t magsq = multiply_16tx16t_add_16bx16b(tmp, tmp);
+      sum[i] = magsq / naverage;
+    }
+  } else {
+    for (int i=0; i < 128; i++) {
+      uint32_t tmp = *((uint32_t *)buffer + i);
+      uint32_t magsq = multiply_16tx16t_add_16bx16b(tmp, tmp);
+      sum[i] += magsq / naverage;
+    }
+  }
+  if (++count == naverage) {
+    count = 0;
+    for (int i=0; i < 128; i++) {
+      output[i] = sqrt_uint32_approx(sum[i]);
+    }
+    outputflag = true;
+  }
+
+ */
 
 void setup() {
 
+  //arm_cfft_radix4_instance_q15 fft_inst;
+
   Serial.begin(9600);
-  delay(1000);
+  delay(100);
   Serial.println("KC1FSZ");
 
   // Configure the Teensy 3.2 pins per the reference and wiring
@@ -40,17 +83,20 @@ void setup() {
   
   // System gating control register.  I2S clock gate control is enabled.
   SIM_SCGC6 |= SIM_SCGC6_I2S;
-  // The MCLK is sourced from the system clock | The MCLK is enabled
-  I2S0_MCR = I2S_MCR_MICS(0) | I2S_MCR_MOE;
+  // The MCLK is sourced from the system clock(0) or PLL(3) | The MCLK is enabled
+  // QUESTION: IT LOOKS lIKE THE PJS CODE USES PLL >20MHz
+  I2S0_MCR = I2S_MCR_MICS(3) | I2S_MCR_MOE;
+  // Loop waiting for the divisor update to complete
+  while (I2S0_MCR & I2S_MCR_DUF) ;
   // Divide down the system clock to get the MCLK
-  I2S0_MDR = I2S_MDR_FRACT(MCLK_FRACT) | I2S_MDR_DIVIDE(MCLK_DIVIDE);
+  I2S0_MDR = I2S_MDR_FRACT(MCLK_MULT-1) | I2S_MDR_DIVIDE(MCLK_DIVIDE-1);
 
   // CONFIGURE TRANSMIT
   // No mask - we are sending both channels of audio
   I2S0_TMR = 0;
   // Set the high water mark for the FIFO.  This determines when the interupt
   // needs to fire.
-  I2S0_TCR1 = I2S_TCR1_TFW(4);
+  I2S0_TCR1 = I2S_TCR1_TFW(1);
   // Asynchronous mode | Bit Clock Active Low | Master Clock 1 Selected |
   // Bit Clock generated internally (master) | Bit Clock Divide
   // Setting DIV=1 means (1+1)*2=4 division of MCLK->BCLK
@@ -58,21 +104,20 @@ void setup() {
      I2S_TCR2_BCD | I2S_TCR2_DIV(1);
   // Transmit channel 0 is enabled | Start of word flag = 0
   I2S0_TCR3 = I2S_TCR3_TCE | I2S_TCR3_WDFL(0);
-  // Frame size = 2 | Sync width = 24 bit clocks | MSB first |
+  // Frame size = 2 | Sync width = 32 bit clocks | MSB first |
   // Frame sync asserts one bit before the first bit of the frame |
-  // Frame sync is active low | Frame sync is generated internally
-  I2S0_TCR4 = I2S_TCR4_FRSZ(1) | I2S_TCR4_SYWD(23) | I2S_TCR4_MF |
-    I2S_TCR4_FSE | 
-    I2S_TCR4_FSD;
-  // Word N Width = 24 | Word 0 Width = 24 | First Bit Shifted = 24
-  I2S0_TCR5 = I2S_TCR5_WNW(23) | I2S_TCR5_W0W(23) | I2S_TCR5_FBT(23);
+  // Frame sync is active low | Frame sync is generated internally (master)
+  I2S0_TCR4 = I2S_TCR4_FRSZ(1) | I2S_TCR4_SYWD(31) | I2S_TCR4_MF |
+    I2S_TCR4_FSE | I2S_TCR4_FSP | I2S_TCR4_FSD;
+  // Word N Width = 32 | Word 0 Width = 32 | First Bit Shifted = 32
+  I2S0_TCR5 = I2S_TCR5_WNW(31) | I2S_TCR5_W0W(31) | I2S_TCR5_FBT(31);
 
   // CONFIGURE RECEIVE
   // No mask - we are sending both channels of audio
   I2S0_RMR = 0;
   // Set the high water mark for the FIFO.  This determines when the interupt
   // needs to fire.
-  I2S0_RCR1 = I2S_RCR1_RFW(4);
+  I2S0_RCR1 = I2S_RCR1_RFW(1);
   // Synchronous with transmitter | Bit Clock Active Low | Master Clock 1 Selected |
   // Bit Clock generated internally (master) | Bit Clock Divide
   // Setting DIV=1 means (1+1)*2=4 division of MCLK->BCLK
@@ -80,13 +125,13 @@ void setup() {
      I2S_RCR2_BCD | I2S_RCR2_DIV(1);
   // Receive channel 0 is enabled | Start of word flag = 0
   I2S0_RCR3 = I2S_RCR3_RCE | I2S_RCR3_WDFL(0);
-  // Frame size = 2 | Sync width = 24 bit clocks | MSB first |
+  // Frame size = 2 | Sync width = 32 bit clocks | MSB first |
   // Frame sync asserts one bit before the first bit of the frame |
   // Frame sync is active low | Frame sync is generated internally
-  I2S0_RCR4 = I2S_RCR4_FRSZ(1) | I2S_RCR4_SYWD(23) | I2S_RCR4_MF |
-    I2S_RCR4_FSE | I2S_RCR4_FSD;
-  // Word N Width = 24 | Word 0 Width = 24 | First Bit Shifted = 24
-  I2S0_RCR5 = I2S_RCR5_WNW(23) | I2S_RCR5_W0W(23) | I2S_RCR5_FBT(23);
+  I2S0_RCR4 = I2S_RCR4_FRSZ(1) | I2S_RCR4_SYWD(31) | I2S_RCR4_MF |
+    I2S_RCR4_FSE | I2S_RCR4_FSP | I2S_RCR4_FSD;
+  // Word N Width = 32 | Word 0 Width = 32 | First Bit Shifted = 32
+  I2S0_RCR5 = I2S_RCR5_WNW(31) | I2S_RCR5_W0W(31) | I2S_RCR5_FBT(31);
 
   // Enable the system-level interrupt for I2S
   NVIC_ENABLE_IRQ(IRQ_I2S0_TX);
@@ -150,12 +195,13 @@ bool isRXFIFOEmpty() {
   110  -2     001 + 1 = 010 ->  2
   111  -1     000 + 1 = 001 ->  1
 */
-CircularBuffer<long,16> leftBuf;
-CircularBuffer<long,16> rightBuf;
+//CircularBuffer<long,16> leftBuf;
+//CircularBuffer<long,16> rightBuf;
 
 volatile bool isRightRead = false;
 volatile bool isRightWrite = false;
 volatile int maxSize = 0;
+volatile int counter = 0;
 
 /**
  * This function writes as much as possible into the FIFO.
@@ -164,47 +210,26 @@ void tryWrite() {
   // Loop
   while (!isTXFIFOFull()) {
     if (!isRightWrite) {
-      if (!leftBuf.isEmpty()) {
-        if (leftBuf.size() > maxSize) {
-          maxSize = leftBuf.size();
-        }
-        I2S0_TDR0 = leftBuf.pop() & 0x00ffffff;
-      }
-      else {
-        I2S0_TDR0 = 0;
-      }
+      I2S0_TDR0 = 0xf0f0f0f0;
       isRightWrite = true;
     } else {
-      if (!rightBuf.isEmpty()) {
-        if (rightBuf.size() > maxSize) {
-          maxSize = rightBuf.size();
-        }
-        I2S0_TDR0 = rightBuf.pop() & 0x00ffffff;
-      } else {
-        I2S0_TDR0 = 0;        
-      }
+      I2S0_TDR0 = 0x0f0f0f0f;        
       isRightWrite = false;
     }
   }
 }
 
 /**
- * This function writes as much as possible into the FIFO.
+ * This function reads as much as possible from the FIFO.
  */
 void tryRead() {
   // Loop
   while (!isRXFIFOEmpty()) {
     // Read a value.  This automatically advances the read pointer
     long v = I2S0_RDR0;  
-    // Sign extend the 24-bit value
-    if (v & 0x00800000) {
-      v |= 0xff000000;
-    }
     if (!isRightRead) {
-      leftBuf.push(v);
       isRightRead = true;
     } else {
-      rightBuf.push(v);
       isRightRead = false;
     }
   }
@@ -229,7 +254,7 @@ void i2s0_rx_isr(void) {
 long lastDisplay = 0;
 
 void loop() {
-
+/*
   if (millis() - lastDisplay > 2000) {
     lastDisplay = millis();
     //Serial.print(leftBuf.pop());
@@ -237,4 +262,5 @@ void loop() {
     //Serial.println(rightBuf.pop());
     Serial.println(maxSize);
   }
+*/
 }
