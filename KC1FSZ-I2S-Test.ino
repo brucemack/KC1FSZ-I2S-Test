@@ -8,16 +8,87 @@
 // Here is the K20 reference manual:
 // https://www.nxp.com/docs/en/reference-manual/K20P64M72SF1RM.pdf
 //
-//#include <CircularBuffer.h>
-
 #include <Audio.h>
-#include <Wire.h>
-#include <SPI.h>
-#include <SD.h>
-#include <SerialFlash.h>
+//#include <Wire.h>
+//#include <SPI.h>
+//#include <SD.h>
+//#include <SerialFlash.h>
 
 AudioControlSGTL5000  sgtl5000_1;
+// This is the largest magnitude that can be represented by the DAC
+const float FullScale = (2 ^ 31) - 1;
 
+// =================================================================================
+// Sine Look Up Table 
+//
+// The LUT only has to cover 90 degrees of the phase range because 
+// we have quadrant translation.
+const unsigned int LutSize = 64;
+// This is the number of phase buckets we manage.  More buckets means 
+// a smoother transition through the baseband signals.
+const unsigned int PhaseRange = LutSize * 4;
+// This is the LUT (filled during setup())
+float SinLut[LutSize];
+
+void BuildLut() {
+  // Build the look-up table.  This will only cover the first 90 
+  // degrees of the sin() function.
+  for (unsigned int i = 0; i < LutSize; i++) {
+    float rad = ((float)i / (float)PhaseRange) * 2.0 * 3.1415926;
+    SinLut[i] = sin(rad);
+  }  
+}
+
+// This function takes an integer phase and returns the sin() value.  Quadrant
+// translation is used to save memory.
+//
+// ph - Integer phase from 0 to PhaseRange - 1
+// returns a float value from -1.0 to 1.0
+//
+float SineWithQuadrant(unsigned int ph) {
+  // Figure out which quandrant we're in and adjust accordingly
+  unsigned int quadrant = ph / LutSize;
+  // There are some special cases here
+  if (ph == LutSize) {
+    return 1.0;
+  } else if (ph == LutSize * 3) {
+    return -1;
+  } else if (quadrant == 0) {
+    return SinLut[ph];
+  } else if (quadrant == 1) {
+    return SinLut[PhaseRange / 2 - ph];
+  } else if (quadrant == 2) {
+    return -SinLut[ph - PhaseRange / 2];
+  } else {
+    return -SinLut[PhaseRange - ph];
+  }
+}
+// =================================================================================
+
+const unsigned int SampleFreqHz = 44100;
+unsigned int PhaseCounter = 0;
+
+/**
+ * Converts a counter value (incremeting at the sample freqency) and a target
+ * frequency and produces a phase value from 0->PhaseRange-1.
+ */
+unsigned int GetPhase(unsigned int counter,unsigned int freqHz) {
+  // We multiply first to maintain precision
+  unsigned int i = (counter * freqHz * PhaseRange) / SampleFreqHz;
+  // Check for wraps
+  while (i >= PhaseRange) {
+    i -= PhaseRange;
+  }
+  return i;
+}
+
+/*
+  // Scale the phase accumulators to the size of the LUT phase range.  Note
+  // that we mutiply before dividing to avoid precision issues
+  unsigned long plPhaseScaled = (plPhaseAccumulator * phaseRange) / sampleFreq;
+  // Do the trig to get the amplitudes (-1 to +1)
+  float plAmp = sinWithQuadrant(plPhaseScaled,sinLut,phaseRange);
+*/
 
 // Clocking calculation for 8K (AK4556)
 //
@@ -77,8 +148,10 @@ if (window) apply_window_to_fft_buffer(buffer, window);
 
 void setup() {
 
+  BuildLut();
+
   //arm_cfft_radix4_instance_q15 fft_inst;
-  AudioMemory(10);
+  //AudioMemory(10);
 
   Serial.begin(9600);
   delay(100);
@@ -208,13 +281,14 @@ bool isRXFIFOEmpty() {
   110  -2     001 + 1 = 010 ->  2
   111  -1     000 + 1 = 001 ->  1
 */
-//CircularBuffer<long,16> leftBuf;
-//CircularBuffer<long,16> rightBuf;
-
 volatile bool isRightRead = false;
 volatile bool isRightWrite = false;
 volatile int maxSize = 0;
 volatile int counter = 0;
+
+volatile float LastS = 0;
+volatile float LastT = 0;
+volatile int LastU = 0;
 
 /**
  * This function writes as much as possible into the FIFO.
@@ -223,8 +297,16 @@ void tryWrite() {
   // Loop
   while (!isTXFIFOFull()) {
     if (!isRightWrite) {
-      counter += (1024 * 1024);
-      I2S0_TDR0 = counter;
+      PhaseCounter++;
+      // Create the phase pointer based on the target frequency
+      unsigned int ph = GetPhase(PhaseCounter,2000);
+      // Cconvert the pointer to sin(phase)
+      LastS = SineWithQuadrant(ph);
+      // Scale up to the DAC range (signed)
+      LastT = LastS * FullScale;
+      // Convert to integer (signed)
+      LastU = (int)LastT;
+      I2S0_TDR0 = (int)LastU;
       isRightWrite = true;
     } else {
       counter += (1024 * 1024);
@@ -271,6 +353,14 @@ long lastDisplay = 0;
 void loop() {
   if (millis() - lastDisplay > 2000) {
     lastDisplay = millis();
-    Serial.println(counter);
+    Serial.print(counter);
+    Serial.print(" ");
+    Serial.print(LastS);
+    Serial.print(" ");
+    Serial.print(LastT);
+    Serial.print(" ");
+    Serial.print(LastU);
+    Serial.print(" ");
+    Serial.println();
   }
 }
