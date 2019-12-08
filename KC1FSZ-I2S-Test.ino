@@ -14,7 +14,7 @@
 #include <SD.h>
 #include <SerialFlash.h>
 
-AudioControlSGTL5000  sgtl5000_1;
+//AudioControlSGTL5000  sgtl5000_1;
 
 // This is the largest magnitude that can be represented by the DAC
 const float FullScale = (2 ^ 31) - 1;
@@ -54,14 +54,16 @@ float SineWithQuadrant(unsigned int ph) {
     return 1.0;
   } else if (ph == LutSize * 3) {
     return -1;
-  } else if (quadrant == 0) {
-    return SinLut[ph];
-  } else if (quadrant == 1) {
-    return SinLut[PhaseRange / 2 - ph];
-  } else if (quadrant == 2) {
-    return -SinLut[ph - PhaseRange / 2];
   } else {
-    return -SinLut[PhaseRange - ph];
+    if (quadrant == 0) {
+      return SinLut[ph];
+    } else if (quadrant == 1) {
+      return SinLut[PhaseRange / 2 - ph];
+    } else if (quadrant == 2) {
+      return -SinLut[ph - PhaseRange / 2];
+    } else {
+      return -SinLut[PhaseRange - ph];
+    }
   }
 }
 // =================================================================================
@@ -96,7 +98,8 @@ unsigned int GetPhase(unsigned int counter,unsigned int freqHz) {
 //#define MCLK_MULT 9
 //#define MCLK_DIVIDE 423
 //
-// Clocking calculations for 44.1K:
+
+// Clocking calculations for 44.1K using 96 Mhz system clock
 //
 // MCLK needs to 256 * 44.100 kHz sample rate = 11.2896 MHz
 // This is given by (CPU frequency * MCLK_MULT) / MCLK_DIV
@@ -104,56 +107,102 @@ unsigned int GetPhase(unsigned int counter,unsigned int freqHz) {
 // MCLK_DIV is a positive integer with range 1-4096 (12 bits)
 // MCLK_MULT must be <= MCLK_DIV
 //
-#define MCLK_MULT 8
-#define MCLK_DIVIDE 51
+#define MCLK_MULT 2
+#define MCLK_DIVIDE 17
 
-//#include <arm_math.h>
+// This is the location for DMA transmit operations
+const int tx_buffer_size = 128;
+// (From PJS) "DMAMEM is not required. It only serves to place your buffers lower in memory.
+// The idea is typical programs will do most of their ordinary memory access to the stack, 
+// located in the upper memory. If your buffers are in lower memory, odds are (maybe) less 
+// of the memory controller adding a wait state if the CPU and DMA want to access the same 
+// region of memory in the same clock cycle.
+DMAMEM __attribute__((aligned(32))) static uint32_t i2s_tx_buffer[tx_buffer_size];
 
-/*
-int16_t buffer[512] __attribute__ ((aligned (4)));
+// This structure matches the layout of the K20 DMA Transfer Control Descriptor
+//
+// Address: 4000_8000h base + 1000h offset + (32d × i), where i=0d to 15d
+//
+struct __attribute__((packed, aligned(4))) TCD {    
+  // Source Address 
+  volatile const void * volatile SADDR;
+  // Signed Source Address Offset - Sign-extended offset applied to the current source 
+  // address to form the next-state value as each source read is completed.
+  int16_t SOFF;
+  // Transfer Attributes
+  uint16_t ATTR;  
+  // TCD word 2's register definition depends on the status of minor loop mapping. 
+  union { 
+    // (DISALBLED) Number of bytes to be transferred in each service request of the channel. 
+    uint32_t NBYTES; 
+    // (ENABLED) SMLOE/DMLOE/Minor Byte Transfer Count
+    uint32_t NBYTES_MLNO;
+    uint32_t NBYTES_MLOFFNO; 
+    uint32_t NBYTES_MLOFFYES; 
+  };
+  // Adjustment value added to the source address at the completion of the major iteration count. 
+  int32_t SLAST;
+  // Destination address
+  volatile void * volatile DADDR;
+  // Signed Source Address Offset - Sign-extended offset applied to the current destination
+  // address to form the next-state value as each source read is completed.  
+  int16_t DOFF;
+  // Current channel linking feature/major iteration count
+  union { 
+    volatile uint16_t CITER;
+    volatile uint16_t CITER_ELINKYES; 
+    volatile uint16_t CITER_ELINKNO; 
+  };
+  // Destination last address adjustment or the memory address for the next transfer control 
+  // descriptor to be loaded into this channel (scatter/gather).
+  int32_t DLASTSGA;
+  // Control and Status
+  volatile uint16_t CSR;
+  //  Beginning Minor Loop Link
+  union { 
+    volatile uint16_t BITER;
+    volatile uint16_t BITER_ELINKYES; 
+    volatile uint16_t BITER_ELINKNO; 
+  };
+};
 
-if (window) apply_window_to_fft_buffer(buffer, window);
-  arm_cfft_radix4_q15(&fft_inst, buffer);
-  // G. Heinzel's paper says we're supposed to average the magnitude
-  // squared, then do the square root at the end.
-  if (count == 0) {
-    for (int i=0; i < 128; i++) {
-      uint32_t tmp = *((uint32_t *)buffer + i);
-      uint32_t magsq = multiply_16tx16t_add_16bx16b(tmp, tmp);
-      sum[i] = magsq / naverage;
-    }
-  } else {
-    for (int i=0; i < 128; i++) {
-      uint32_t tmp = *((uint32_t *)buffer + i);
-      uint32_t magsq = multiply_16tx16t_add_16bx16b(tmp, tmp);
-      sum[i] += magsq / naverage;
-    }
-  }
-  if (++count == naverage) {
-    count = 0;
-    for (int i=0; i < 128; i++) {
-      output[i] = sqrt_uint32_approx(sum[i]);
-    }
-    outputflag = true;
-  }
+volatile long v = 0;
 
- */
+// Interrupt service routine from DMA controller
+void dma_isr_function(void) {  
+
+  v++;
+  
+  // The INT register provides a bit map for the 16 channels signaling the presence of an
+  // interrupt request for each channel. Depending on the appropriate bit setting in the
+  // transfer-control descriptors, the eDMA engine generates an interrupt on data transfer
+  // completion. The outputs of this register are directly routed to the interrupt controller
+  // (INTC). During the interrupt-service routine associated with any given channel, it is the
+  // software’s responsibility to clear the appropriate bit, negating the interrupt request.
+  // Typically, a write to the CINT register in the interrupt service routine is used for this
+  // purpose.
+  
+  // Clear interrupt request for channel 0
+  DMA_CINT = 0;
+}
 
 void setup() {
 
-  Serial.begin(9600);
-  delay(100);
+  Serial.begin(115200);
+  delay(3000);
   Serial.println("KC1FSZ");
 
-  BuildLut();
-  
-  Serial.println("Complete");
+  //BuildLut();
 
-  //arm_cfft_radix4_instance_q15 fft_inst;
-  AudioMemory(10);
+  // Fill the transmit area
+  for (int i = 0; i < tx_buffer_size; i++) {
+    i2s_tx_buffer[i] = (i * 2 + 1) << 16 | i * 2;
+  }
 
-  sgtl5000_1.enable();
-  sgtl5000_1.volume(1.0);
+  //AudioMemory(10);
+
+  //sgtl5000_1.enable();
+  //sgtl5000_1.volume(1.0);
 
   // Configure the Teensy 3.2 pins per the reference and wiring
   PORTC_PCR3 = PORT_PCR_MUX(6); // Alt 6 is BLCK - T3.2 pin 9
@@ -161,12 +210,43 @@ void setup() {
   PORTC_PCR1 = PORT_PCR_MUX(6); // Alt 6 is TXD0 - T3.2 pin 22
   PORTC_PCR2 = PORT_PCR_MUX(6); // Alt 6 is LRCLK - T3.2 pin 23
   PORTC_PCR5 = PORT_PCR_MUX(4); // Alt 4 is RXD0 - T3.2 pin 13
+
+  // ----- Enable DMA ----------------------------------------------------
+  //
+  // Enable clocks for DMA Mux and eDMA 
+  SIM_SCGC7 |= SIM_SCGC7_DMA;
+  SIM_SCGC6 |= SIM_SCGC6_DMAMUX;  
+
+  int channel = 0;
+
+  __enable_irq();
   
+  DMA_CR = DMA_CR_EMLM | DMA_CR_EDBG; // minor loop mapping is available
+  DMA_CERQ = channel;
+  DMA_CERR = channel;
+  DMA_CEEI = channel;
+  DMA_CINT = channel;
+
+  struct TCD* tcd = 0x40009000 + (32 * channel); 
+  // Clear 
+  uint32_t *p = (uint32_t *)tcd;
+  *p++ = 0;
+  *p++ = 0;
+  *p++ = 0;
+  *p++ = 0;
+  *p++ = 0;
+  *p++ = 0;
+  *p++ = 0;
+  *p++ = 0;
+
+  // ----- Configure I2S ---------------------------------------------------------
+
   // System gating control register.  I2S clock gate control is enabled.
   SIM_SCGC6 |= SIM_SCGC6_I2S;
+  
   // The MCLK is sourced from the system clock(0) or PLL(3) | The MCLK is enabled
   // QUESTION: IT LOOKS lIKE THE PJS CODE USES PLL >20MHz
-  I2S0_MCR = I2S_MCR_MICS(0) | I2S_MCR_MOE;
+  I2S0_MCR = I2S_MCR_MICS(3) | I2S_MCR_MOE;
   // Loop waiting for the divisor update to complete
   while (I2S0_MCR & I2S_MCR_DUF) ;
   // Divide down the system clock to get the MCLK
@@ -177,7 +257,7 @@ void setup() {
   I2S0_TMR = 0;
   // Set the high water mark for the FIFO.  This determines when the interupt
   // needs to fire.
-  I2S0_TCR1 = I2S_TCR1_TFW(4);
+  I2S0_TCR1 = I2S_TCR1_TFW(1);
   // Asynchronous mode | Bit Clock Active Low | Master Clock 1 Selected |
   // Bit Clock generated internally (master) | Bit Clock Divide
   // Setting DIV=1 means (1+1)*2=4 division of MCLK->BCLK
@@ -198,7 +278,7 @@ void setup() {
   I2S0_RMR = 0;
   // Set the high water mark for the FIFO.  This determines when the interupt
   // needs to fire.
-  I2S0_RCR1 = I2S_RCR1_RFW(4);
+  I2S0_RCR1 = I2S_RCR1_RFW(1);
   // Synchronous with transmitter | Bit Clock Active Low | Master Clock 1 Selected |
   // Bit Clock generated internally (master) | Bit Clock Divide
   // Setting DIV=1 means (1+1)*2=4 division of MCLK->BCLK
@@ -214,19 +294,79 @@ void setup() {
   // Word N Width = 32 | Word 0 Width = 32 | First Bit Shifted = 32
   I2S0_RCR5 = I2S_RCR5_WNW(31) | I2S_RCR5_W0W(31) | I2S_RCR5_FBT(31);
 
+  // ----- Configure DMA -------------------------------------------------------
+
+  // Configure the source source buffer
+  tcd->SADDR = i2s_tx_buffer;
+  // Amount that the source address is adjusted after each read.  
+  // Note that we are handling 16-bit data so this value is 2 bytes.
+  tcd->SOFF = 2;
+  // Source and destination modulo disabled.  Source and destination transfer
+  // sizes are 16 bits.
+  tcd->ATTR = DMA_TCD_ATTR_SSIZE(1) | DMA_TCD_ATTR_DSIZE(1);
+  // Minor loop mapping is disabled.  Minor byte transfer count.
+  tcd->NBYTES_MLNO = 2;
+  // Adjustment value added to the source address at the completion of the major iteration count. 
+  // Moving things back to the initial value.
+  tcd->SLAST = -sizeof(i2s_tx_buffer);
+  // Destination - High side of 32 bit register
+  tcd->DADDR = (void*)((uint32_t)&I2S0_TDR0 + 2);
+  // Sign-extended offset applied to the current destination address to form the next-state 
+  // value as each destination write is completed. No movement needed here.
+  tcd->DOFF = 0;
+  // Channel linking is disabled, current major iteration count. This is half because
+  // each tranfer moves two byes.
+  tcd->CITER_ELINKNO = sizeof(i2s_tx_buffer) / 2;
+  // Scatter/gather not used
+  tcd->DLASTSGA = 0;
+  // Channel linking is disabled, begin major iteration count
+  tcd->BITER_ELINKNO = sizeof(i2s_tx_buffer) / 2;
+  // Generate interrupt when major counter is half done.  Specifically, the comparison
+  // performed by the eDMA engine is (CITER == (BITER >> 1)). 
+  // Generate interrupt when major counter completes
+  tcd->CSR = DMA_TCD_CSR_INTHALF | DMA_TCD_CSR_INTMAJOR;
+
+  // Get the mux setup 
+  uint8_t source = DMAMUX_SOURCE_I2S0_TX;
+  volatile uint8_t* mux = (volatile uint8_t*)&(DMAMUX0_CHCFG0) + channel;
+  *mux = 0;
+  *mux = (source & 63) | DMAMUX_ENABLE;
+
+  // Install the interrupt handler
+  //
+  // _VectorsRam is created by the Teensy library and it has been initialized
+  // using the flash vector table. 
+  //
+  // void (* _VectorsRam[NVIC_NUM_INTERRUPTS+16])(void);
+  //
+  // This is the code that maps the RAM table:
+  //
+  // SCB_VTOR = (uint32_t)_VectorsRam; // use vector table in RAM
+  //
+  // There are 16 extra entries in the table before the normal IRQ entries
+  //
+  _VectorsRam[16 + IRQ_DMA_CH0 + channel] = dma_isr_function;
+  NVIC_ENABLE_IRQ(IRQ_DMA_CH0 + channel);
+
   // Enable the system-level interrupt for I2S
-  NVIC_ENABLE_IRQ(IRQ_I2S0_TX);
-  NVIC_ENABLE_IRQ(IRQ_I2S0_RX);
+  //NVIC_ENABLE_IRQ(IRQ_I2S0_TX);
+  //NVIC_ENABLE_IRQ(IRQ_I2S0_RX);
+
+  // ------ Final Enable -------------------------------------------------------
+  
+  // Set Enable Request Register (DMA_SERQ). Enable DMA for the specified channel 
+  DMA_SERQ = channel;
 
   // Software reset
   I2S0_TCSR = I2S_TCSR_SR;
-  I2S0_RCSR = I2S_RCSR_SR;
+  //I2S0_RCSR = I2S_RCSR_SR;
 
-  // Receive enabled | FIFO request interrupt enable
-  I2S0_RCSR = I2S_RCSR_RE | I2S_RCSR_FRIE;
+  // Transmit enabled | Bit clock enabled | FIFO request DMA enable
+  I2S0_TCSR = I2S_TCSR_TE | I2S_TCSR_BCE | I2S_TCSR_FRDE;
+  // Receive enabled | FIFO request DMA enable
+  //I2S0_RCSR = I2S_RCSR_RE | I2S_RCSR_FRDE;
 
-  // Transmit enabled | Bit clock enabled | FIFO request interrupt enable
-  I2S0_TCSR = I2S_TCSR_TE | I2S_TCSR_BCE | I2S_TCSR_FRIE;
+  Serial.println("setup() done");
 }
 
 /*
@@ -297,9 +437,6 @@ void tryWrite() {
       // Create the phase pointer based on the target frequency
       unsigned int ph = GetPhase(PhaseCounter,2000);
       LastR = ph;
-      if (ph > 255) {
-        Serial.println("XXXX");
-      }
       // Convert the pointer to sin(phase)
       //LastS = SineWithQuadrant(ph);
       /*
@@ -352,21 +489,11 @@ void i2s0_rx_isr(void) {
   sei();
 }
 
-long lastDisplay = 0;
+volatile long lastDisplay = 0;
 
 void loop() {
-  if (millis() - lastDisplay > 2000) {
+  if (millis() - lastDisplay > 1000) {
     lastDisplay = millis();
-    Serial.print(counter);
-    Serial.print(" ");
-    Serial.print(LastR);
-    Serial.print(" ");
-    Serial.print(LastS);
-    Serial.print(" ");
-    Serial.print(LastT);
-    Serial.print(" ");
-    Serial.print(LastU);
-    Serial.print(" ");
-    Serial.println();
+    Serial.println(v);
   }
 }
