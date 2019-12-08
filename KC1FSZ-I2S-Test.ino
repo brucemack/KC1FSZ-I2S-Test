@@ -1,20 +1,14 @@
 // This is a very simple "hello world" test of the K20 (Teensy 3.2)
 // I2S audio output.
 //
-// Uses 16 bit audio.  Plays a ramp through both the L and R channels.
-//
 // Bruce MacKinnon KC1FSZ
 //
 // Here is the K20 reference manual:
 // https://www.nxp.com/docs/en/reference-manual/K20P64M72SF1RM.pdf
 //
 #include <Audio.h>
-#include <Wire.h>
-#include <SPI.h>
-#include <SD.h>
-#include <SerialFlash.h>
 
-//AudioControlSGTL5000  sgtl5000_1;
+AudioControlSGTL5000  sgtl5000_1;
 
 // This is the largest magnitude that can be represented by the DAC
 const float FullScale = (2 ^ 31) - 1;
@@ -110,8 +104,11 @@ unsigned int GetPhase(unsigned int counter,unsigned int freqHz) {
 #define MCLK_MULT 2
 #define MCLK_DIVIDE 17
 
-// This is the location for DMA transmit operations
+// This is the size of the buffer used for DMA transmit operations
 const int tx_buffer_size = 128;
+
+// Create the buffer from which DMA transmit operations will happen.
+//
 // (From PJS) "DMAMEM is not required. It only serves to place your buffers lower in memory.
 // The idea is typical programs will do most of their ordinary memory access to the stack, 
 // located in the upper memory. If your buffers are in lower memory, odds are (maybe) less 
@@ -167,10 +164,14 @@ struct __attribute__((packed, aligned(4))) TCD {
 };
 
 volatile long v = 0;
+volatile bool firstHalf = false;
 
 // Interrupt service routine from DMA controller
-void dma_isr_function(void) {  
+void tx_dma_isr_function(void) {  
 
+  int channel = 0;
+  struct TCD* tcd = (struct TCD*)(0x40009000 + (32 * channel)); 
+  uint32_t* saddr = (uint32_t*)tcd->SADDR;
   v++;
   
   // The INT register provides a bit map for the 16 channels signaling the presence of an
@@ -184,6 +185,13 @@ void dma_isr_function(void) {
   
   // Clear interrupt request for channel 0
   DMA_CINT = 0;
+
+  // Check to see what part of the TX buffer the DMA channel is working on 
+  if (saddr < i2s_tx_buffer + (tx_buffer_size / 2)) {
+    firstHalf = true;
+  } else {
+    firstHalf = false;
+  }
 }
 
 void setup() {
@@ -192,17 +200,16 @@ void setup() {
   delay(3000);
   Serial.println("KC1FSZ");
 
-  //BuildLut();
+  // Builds the SINE/4 look-up table
+  BuildLut();
 
   // Fill the transmit area
-  for (int i = 0; i < tx_buffer_size; i++) {
-    i2s_tx_buffer[i] = (i * 2 + 1) << 16 | i * 2;
-  }
+  //for (int i = 0; i < tx_buffer_size; i++) {
+  //  i2s_tx_buffer[i] = (i * 2 + 1) << 16 | i * 2;
+  //}
 
-  //AudioMemory(10);
-
-  //sgtl5000_1.enable();
-  //sgtl5000_1.volume(1.0);
+  sgtl5000_1.enable();
+  sgtl5000_1.volume(1.0);
 
   // Configure the Teensy 3.2 pins per the reference and wiring
   PORTC_PCR3 = PORT_PCR_MUX(6); // Alt 6 is BLCK - T3.2 pin 9
@@ -345,7 +352,7 @@ void setup() {
   //
   // There are 16 extra entries in the table before the normal IRQ entries
   //
-  _VectorsRam[16 + IRQ_DMA_CH0 + channel] = dma_isr_function;
+  _VectorsRam[16 + IRQ_DMA_CH0 + channel] = tx_dma_isr_function;
   NVIC_ENABLE_IRQ(IRQ_DMA_CH0 + channel);
 
   // Enable the system-level interrupt for I2S
@@ -421,63 +428,11 @@ volatile bool isRightWrite = false;
 volatile int maxSize = 0;
 volatile int counter = 0;
 
-volatile int LastR = 0;
-volatile float LastS = 0;
-volatile float LastT = 0;
-volatile int LastU = 0;
-
-/**
- * This function writes as much as possible into the FIFO.
- */
-void tryWrite() {
-  // Loop
-  while (!isTXFIFOFull()) {
-    if (!isRightWrite) {
-      PhaseCounter++;
-      // Create the phase pointer based on the target frequency
-      unsigned int ph = GetPhase(PhaseCounter,2000);
-      LastR = ph;
-      // Convert the pointer to sin(phase)
-      //LastS = SineWithQuadrant(ph);
-      /*
-      // Scale up to the DAC range (signed)
-      LastT = LastS * FullScale;
-      // Convert to integer (signed)
-      LastU = (int)LastT;
-      I2S0_TDR0 = (int)LastU;
-      */
-      counter += (1024 * 1024);
-      I2S0_TDR0 = counter; 
-      isRightWrite = true;
-    } else {
-      counter += (1024 * 1024);
-      I2S0_TDR0 = counter; 
-      isRightWrite = false;
-    }
-  }
-}
-
-/**
- * This function reads as much as possible from the FIFO.
- */
-void tryRead() {
-  // Loop
-  while (!isRXFIFOEmpty()) {
-    // Read a value.  This automatically advances the read pointer
-    long v = I2S0_RDR0;  
-    if (!isRightRead) {
-      isRightRead = true;
-    } else {
-      isRightRead = false;
-    }
-  }
-}
-
 // This gets called whenever the FIFO interupt is raised
 void i2s0_tx_isr(void) {
   cli();
   // Replenish the FIFO as quickly as possible
-  tryWrite();
+  //tryWrite();
   sei();
 }
 
@@ -485,15 +440,18 @@ void i2s0_tx_isr(void) {
 void i2s0_rx_isr(void) {
   cli();
   // Empty the FIFO as quickly as possible
-  tryRead();
+  //tryRead();
   sei();
 }
 
 volatile long lastDisplay = 0;
 
 void loop() {
-  if (millis() - lastDisplay > 1000) {
+  if (millis() - lastDisplay > 250) {
     lastDisplay = millis();
-    Serial.println(v);
+    Serial.print(v);
+    Serial.print(" ");
+    Serial.print(firstHalf);
+    Serial.println();
   }
 }
