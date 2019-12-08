@@ -10,8 +10,8 @@
 
 AudioControlSGTL5000  sgtl5000_1;
 
-// This is the largest magnitude that can be represented by the DAC
-const float FullScale = (2 ^ 31) - 1;
+// This is the largest magnitude that can be represented by the 16 bit DEC
+const float FullScale = pow(2,15) - 1;
 
 // =================================================================================
 // Sine Look Up Table 
@@ -22,15 +22,20 @@ const unsigned int LutSize = 64;
 // This is the number of phase buckets we manage.  More buckets means 
 // a smoother transition through the baseband signals.
 const unsigned int PhaseRange = LutSize * 4;
+const int SinLutFullScale = FullScale;
 // This is the LUT (filled during setup())
-float SinLut[LutSize];
+int SinLut[LutSize];
 
 void BuildLut() {
+  Serial.println(FullScale);
   // Build the look-up table.  This will only cover the first 90 
   // degrees of the sin() function.
   for (unsigned int i = 0; i < LutSize; i++) {
     float rad = ((float)i / (float)PhaseRange) * 2.0 * 3.1415926;
-    SinLut[i] = sin(rad);
+    SinLut[i] = sin(rad) * FullScale;
+    Serial.print(i);
+    Serial.print(" ");
+    Serial.println(SinLut[i]);
   }  
 }
 
@@ -38,16 +43,16 @@ void BuildLut() {
 // translation is used to save memory.
 //
 // ph - Integer phase from 0 to PhaseRange - 1
-// returns a float value from -1.0 to 1.0
+// returns a float value from -FULL_SCALE to +FULL_SCALE
 //
-float SineWithQuadrant(unsigned int ph) {
+int SineWithQuadrant(unsigned int ph) {
   // Figure out which quandrant we're in and adjust accordingly
   unsigned int quadrant = ph / LutSize;
   // There are some special cases here
   if (ph == LutSize) {
-    return 1.0;
+    return SinLutFullScale;
   } else if (ph == LutSize * 3) {
-    return -1;
+    return -SinLutFullScale;
   } else {
     if (quadrant == 0) {
       return SinLut[ph];
@@ -166,6 +171,10 @@ struct __attribute__((packed, aligned(4))) TCD {
 volatile long v = 0;
 volatile bool firstHalf = false;
 
+const unsigned int ToneFreqHz = 2000;
+const unsigned int PhaseStep = ToneFreqHz * PhaseRange / SampleFreqHz;
+unsigned int PhasePtr = 0;
+
 // Interrupt service routine from DMA controller
 void tx_dma_isr_function(void) {  
 
@@ -173,7 +182,7 @@ void tx_dma_isr_function(void) {
   struct TCD* tcd = (struct TCD*)(0x40009000 + (32 * channel)); 
   uint32_t* saddr = (uint32_t*)tcd->SADDR;
   v++;
-  
+ 
   // The INT register provides a bit map for the 16 channels signaling the presence of an
   // interrupt request for each channel. Depending on the appropriate bit setting in the
   // transfer-control descriptors, the eDMA engine generates an interrupt on data transfer
@@ -186,12 +195,30 @@ void tx_dma_isr_function(void) {
   // Clear interrupt request for channel 0
   DMA_CINT = 0;
 
-  // Check to see what part of the TX buffer the DMA channel is working on 
+  // Check to see what part of the TX buffer the DMA channel is working on.  If 
+  // the DMA is working on the first half of the buffer then the new data should
+  // be flowed into the second half.
+  int startPtr = 0;
   if (saddr < i2s_tx_buffer + (tx_buffer_size / 2)) {
-    firstHalf = true;
-  } else {
-    firstHalf = false;
+    startPtr = (tx_buffer_size / 2);
   }
+
+  // We will be populating half of the buffer, depending on where the DMA channel
+  // is working.  Notice also that we are only dealing with one side L/R.
+  
+  for (unsigned int i = 0; i < (tx_buffer_size / 2); i++) {
+    
+    // Cycle through the phase
+    PhasePtr += PhaseStep;
+    // Wrap the phase pointer if needed
+    while (PhasePtr >= PhaseRange) {
+      PhasePtr -= PhaseRange; 
+    }
+    // Get the sine function from the lookup
+    int v = SineWithQuadrant(PhasePtr);
+    // We need to shift the data up to the high side of the 32-bit word
+    i2s_tx_buffer[startPtr + i] = (v << 16);
+  }  
 }
 
 void setup() {
@@ -449,9 +476,9 @@ volatile long lastDisplay = 0;
 void loop() {
   if (millis() - lastDisplay > 250) {
     lastDisplay = millis();
-    Serial.print(v);
-    Serial.print(" ");
-    Serial.print(firstHalf);
-    Serial.println();
+    //Serial.print(v);
+    //Serial.print(" ");
+    //Serial.print(firstHalf);
+    //Serial.println();
   }
 }
