@@ -5,8 +5,14 @@
 //
 // Here is the K20 reference manual:
 // https://www.nxp.com/docs/en/reference-manual/K20P64M72SF1RM.pdf
+// 
+// For Teensy 4.0:
+// https://www.pjrc.com/teensy/IMXRT1060RM_rev1.pdf
+// 
 //
 #include <Audio.h>
+
+#include "utility/imxrt_hw.h"
 
 AudioControlSGTL5000  sgtl5000_1;
 
@@ -84,20 +90,6 @@ unsigned int GetPhase(unsigned int counter,unsigned int freqHz) {
   return i;
 }
 
-// Clocking calculation for 8K (AK4556)
-//
-//   96 MHz system clock
-//   9/423 multiply/divide
-//   2,042,533 Hz MCLK
-//   DIV=1 -> divide by (1+1)*2=4
-//   510,638 Hz BCLK
-//   There are 24x2 bits in a frame (L+R)
-//   Fs is 7,978 Hz 
-//
-//#define MCLK_MULT 9
-//#define MCLK_DIVIDE 423
-//
-
 // Clocking calculations for 44.1K using 96 Mhz system clock
 //
 // MCLK needs to 256 * 44.100 kHz sample rate = 11.2896 MHz
@@ -106,8 +98,8 @@ unsigned int GetPhase(unsigned int counter,unsigned int freqHz) {
 // MCLK_DIV is a positive integer with range 1-4096 (12 bits)
 // MCLK_MULT must be <= MCLK_DIV
 //
-#define MCLK_MULT 2
-#define MCLK_DIVIDE 17
+//#define MCLK_MULT 2
+//#define MCLK_DIVIDE 17
 
 // This is the size of the buffer used for DMA transmit operations
 const int tx_buffer_size = 128;
@@ -179,7 +171,7 @@ unsigned int PhasePtr = 0;
 void tx_dma_isr_function(void) {  
 
   int channel = 0;
-  struct TCD* tcd = (struct TCD*)(0x40009000 + (32 * channel)); 
+  struct TCD* tcd = (struct TCD*)(0x400E9000 + 32 * channel); 
   uint32_t* saddr = (uint32_t*)tcd->SADDR;
   v++;
  
@@ -238,95 +230,100 @@ void setup() {
   sgtl5000_1.enable();
   sgtl5000_1.volume(1.0);
 
-  // Configure the Teensy 3.2 pins per the reference and wiring
-  PORTC_PCR3 = PORT_PCR_MUX(6); // Alt 6 is BLCK - T3.2 pin 9
-  PORTC_PCR6 = PORT_PCR_MUX(6); // Alt 6 is MCLK - T3.2 pin 11
-  PORTC_PCR1 = PORT_PCR_MUX(6); // Alt 6 is TXD0 - T3.2 pin 22
-  PORTC_PCR2 = PORT_PCR_MUX(6); // Alt 6 is LRCLK - T3.2 pin 23
-  PORTC_PCR5 = PORT_PCR_MUX(4); // Alt 4 is RXD0 - T3.2 pin 13
-
   // ----- Enable DMA ----------------------------------------------------
   //
-  // Enable clocks for DMA Mux and eDMA 
-  SIM_SCGC7 |= SIM_SCGC7_DMA;
-  SIM_SCGC6 |= SIM_SCGC6_DMAMUX;  
+  // DMAChannel.begin()
+  // ==================
+  //
+  __disable_irq();
 
-  int channel = 0;
-
-  __enable_irq();
+  // Decide which channel to use
+  uint8_t channel = 0;
+  uint32_t ch = 0;
   
-  DMA_CR = DMA_CR_EMLM | DMA_CR_EDBG; // minor loop mapping is available
-  DMA_CERQ = channel;
-  DMA_CERR = channel;
-  DMA_CEEI = channel;
-  DMA_CINT = channel;
+  __enable_irq();
 
-  struct TCD* tcd = 0x40009000 + (32 * channel); 
+  channel = ch;
+
+  // Clock control
+  CCM_CCGR5 |= CCM_CCGR5_DMA(CCM_CCGR_ON);
+
+  DMA_CR = DMA_CR_GRP1PRI | DMA_CR_EMLM | DMA_CR_EDBG;
+  DMA_CERQ = ch;
+  DMA_CERR = ch;
+  DMA_CEEI = ch;
+  DMA_CINT = ch;
+
+  // Establish pointer to control structure
+  struct TCD* tcd = (struct TCD*)(0x400E9000 + ch * 32); 
   // Clear 
   uint32_t *p = (uint32_t *)tcd;
-  *p++ = 0;
-  *p++ = 0;
-  *p++ = 0;
-  *p++ = 0;
-  *p++ = 0;
-  *p++ = 0;
-  *p++ = 0;
-  *p++ = 0;
+  for (int i = 0; i < 8; i++)
+    *p++ = 0;
 
-  // ----- Configure I2S ---------------------------------------------------------
-
-  // System gating control register.  I2S clock gate control is enabled.
-  SIM_SCGC6 |= SIM_SCGC6_I2S;
+  // AudioOutputI2S::config_i2s(void)
+  // ================================
   
-  // The MCLK is sourced from the system clock(0) or PLL(3) | The MCLK is enabled
-  // QUESTION: IT LOOKS lIKE THE PJS CODE USES PLL >20MHz
-  I2S0_MCR = I2S_MCR_MICS(3) | I2S_MCR_MOE;
-  // Loop waiting for the divisor update to complete
-  while (I2S0_MCR & I2S_MCR_DUF) ;
-  // Divide down the system clock to get the MCLK
-  I2S0_MDR = I2S_MDR_FRACT(MCLK_MULT-1) | I2S_MDR_DIVIDE(MCLK_DIVIDE-1);
+  // Enable clock for SAI1 module
+  CCM_CCGR5 |= CCM_CCGR5_SAI1(CCM_CCGR_ON);
+
+  // TODO: AUDIO_SAMPLE_RATE_EXACT
+  int fs = 44100;
+  // PLL between 27*24 = 648 MHz and 54*24=1296 MHz
+  // SAI prescaler 4 => (n1*n2) = multiple of 4
+  int n1 = 4;
+  int n2 = 1 + (24000000 * 27) / (fs + 256 * n1);
+  double C = ((double)fs * 256 * n1 * n2) / 24000000;
+  int c0 = C;
+  int c2 = 10000;
+  int c1 = C * c2 - (c0 * c2);
+  // TODO: UNDERSTAND THIS
+  set_audioClock(c0,c1,c2);
+
+  // clear SAI1_CLK register locations
+  // &0x03 // (0,1,2): PLL3PFD0, PLL5, PLL4
+  CCM_CSCMR1 = (CCM_CSCMR1 & ~(CCM_CSCMR1_SAI1_CLK_SEL_MASK))
+       | CCM_CSCMR1_SAI1_CLK_SEL(2); 
+  CCM_CS1CDR = (CCM_CS1CDR & ~(CCM_CS1CDR_SAI1_CLK_PRED_MASK | CCM_CS1CDR_SAI1_CLK_PODF_MASK))
+       | CCM_CS1CDR_SAI1_CLK_PRED(n1-1) // &0x07
+       | CCM_CS1CDR_SAI1_CLK_PODF(n2-1); // &0x3f
+
+  // Select MCLK
+  IOMUXC_GPR_GPR1 = (IOMUXC_GPR_GPR1
+    & ~(IOMUXC_GPR_GPR1_SAI1_MCLK1_SEL_MASK))
+    | (IOMUXC_GPR_GPR1_SAI1_MCLK_DIR | IOMUXC_GPR_GPR1_SAI1_MCLK1_SEL(0));
+
+  CORE_PIN23_CONFIG = 3;  //1:MCLK
+  CORE_PIN21_CONFIG = 3;  //1:RX_BCLK
+  CORE_PIN20_CONFIG = 3;  //1:RX_SYNC
+
+  int rsync = 0;
+  int tsync = 1;
 
   // CONFIGURE TRANSMIT
   // No mask - we are sending both channels of audio
-  I2S0_TMR = 0;
+  I2S1_TMR = 0;
   // Set the high water mark for the FIFO.  This determines when the interupt
   // needs to fire.
-  I2S0_TCR1 = I2S_TCR1_TFW(1);
-  // Asynchronous mode | Bit Clock Active Low | Master Clock 1 Selected |
-  // Bit Clock generated internally (master) | Bit Clock Divide
-  // Setting DIV=1 means (1+1)*2=4 division of MCLK->BCLK
-  I2S0_TCR2 = I2S_TCR2_SYNC(0) | I2S_TCR2_BCP | I2S_TCR2_MSEL(1) |
-     I2S_TCR2_BCD | I2S_TCR2_DIV(1);
-  // Transmit channel 0 is enabled | Start of word flag = 0
-  I2S0_TCR3 = I2S_TCR3_TCE | I2S_TCR3_WDFL(0);
-  // Frame size = 2 | Sync width = 32 bit clocks | MSB first |
-  // Frame sync asserts one bit before the first bit of the frame |
-  // Frame sync is active low | Frame sync is generated internally (master)
-  I2S0_TCR4 = I2S_TCR4_FRSZ(1) | I2S_TCR4_SYWD(31) | I2S_TCR4_MF |
-    I2S_TCR4_FSE | I2S_TCR4_FSP | I2S_TCR4_FSD;
-  // Word N Width = 32 | Word 0 Width = 32 | First Bit Shifted = 32
-  I2S0_TCR5 = I2S_TCR5_WNW(31) | I2S_TCR5_W0W(31) | I2S_TCR5_FBT(31);
+  I2S1_TCR1 = I2S_TCR1_RFW(1);
+  I2S1_TCR2 = I2S_TCR2_SYNC(tsync) | I2S_TCR2_BCP // sync=0; tx is async;
+        | (I2S_TCR2_BCD | I2S_TCR2_DIV((1)) | I2S_TCR2_MSEL(1));
+  I2S1_TCR3 = I2S_TCR3_TCE;
+  I2S1_TCR4 = I2S_TCR4_FRSZ((2-1)) | I2S_TCR4_SYWD((32-1)) | I2S_TCR4_MF
+        | I2S_TCR4_FSD | I2S_TCR4_FSE | I2S_TCR4_FSP;
+  I2S1_TCR5 = I2S_TCR5_WNW((32-1)) | I2S_TCR5_W0W((32-1)) | I2S_TCR5_FBT((32-1));
 
   // CONFIGURE RECEIVE
-  // No mask - we are sending both channels of audio
-  I2S0_RMR = 0;
-  // Set the high water mark for the FIFO.  This determines when the interupt
-  // needs to fire.
-  I2S0_RCR1 = I2S_RCR1_RFW(1);
-  // Synchronous with transmitter | Bit Clock Active Low | Master Clock 1 Selected |
-  // Bit Clock generated internally (master) | Bit Clock Divide
-  // Setting DIV=1 means (1+1)*2=4 division of MCLK->BCLK
-  I2S0_RCR2 = I2S_RCR2_SYNC(1) | I2S_RCR2_BCP | I2S_RCR2_MSEL(1) |
-     I2S_RCR2_BCD | I2S_RCR2_DIV(1);
-  // Receive channel 0 is enabled | Start of word flag = 0
-  I2S0_RCR3 = I2S_RCR3_RCE | I2S_RCR3_WDFL(0);
-  // Frame size = 2 | Sync width = 32 bit clocks | MSB first |
-  // Frame sync asserts one bit before the first bit of the frame |
-  // Frame sync is active low | Frame sync is generated internally
-  I2S0_RCR4 = I2S_RCR4_FRSZ(1) | I2S_RCR4_SYWD(31) | I2S_RCR4_MF |
-    I2S_RCR4_FSE | I2S_RCR4_FSP | I2S_RCR4_FSD;
-  // Word N Width = 32 | Word 0 Width = 32 | First Bit Shifted = 32
-  I2S0_RCR5 = I2S_RCR5_WNW(31) | I2S_RCR5_W0W(31) | I2S_RCR5_FBT(31);
+  I2S1_RMR = 0;
+  I2S1_RCR1 = I2S_RCR1_RFW(1);
+  I2S1_RCR2 = I2S_RCR2_SYNC(rsync) | I2S_RCR2_BCP  // sync=0; rx is async;
+        | (I2S_RCR2_BCD | I2S_RCR2_DIV((1)) | I2S_RCR2_MSEL(1));
+  I2S1_RCR3 = I2S_RCR3_RCE;
+  I2S1_RCR4 = I2S_RCR4_FRSZ((2-1)) | I2S_RCR4_SYWD((32-1)) | I2S_RCR4_MF
+        | I2S_RCR4_FSE | I2S_RCR4_FSP | I2S_RCR4_FSD;
+  I2S1_RCR5 = I2S_RCR5_WNW((32-1)) | I2S_RCR5_W0W((32-1)) | I2S_RCR5_FBT((32-1));
+
+  CORE_PIN7_CONFIG = 3; //1:TX_DATA0
 
   // ----- Configure DMA -------------------------------------------------------
 
@@ -343,8 +340,6 @@ void setup() {
   // Adjustment value added to the source address at the completion of the major iteration count. 
   // Moving things back to the initial value.
   tcd->SLAST = -sizeof(i2s_tx_buffer);
-  // Destination - High side of 32 bit register
-  tcd->DADDR = (void*)((uint32_t)&I2S0_TDR0 + 2);
   // Sign-extended offset applied to the current destination address to form the next-state 
   // value as each destination write is completed. No movement needed here.
   tcd->DOFF = 0;
@@ -359,13 +354,29 @@ void setup() {
   // performed by the eDMA engine is (CITER == (BITER >> 1)). 
   // Generate interrupt when major counter completes
   tcd->CSR = DMA_TCD_CSR_INTHALF | DMA_TCD_CSR_INTMAJOR;
+  // Destination - High side of 32 bit register
+  tcd->DADDR = (void*)((uint32_t)&I2S1_TDR0 + 2);
+
+  // DMAChannel::triggerAtHardwareEvent()
+  // ====================================
 
   // Get the mux setup 
-  uint8_t source = DMAMUX_SOURCE_I2S0_TX;
-  volatile uint8_t* mux = (volatile uint8_t*)&(DMAMUX0_CHCFG0) + channel;
+  uint8_t source = DMAMUX_SOURCE_SAI1_TX;
+  volatile uint32_t* mux = &DMAMUX_CHCFG0 + channel;
   *mux = 0;
-  *mux = (source & 63) | DMAMUX_ENABLE;
+  *mux = (source & 0x7F) | DMAMUX_CHCFG_ENBL;
 
+  // DMAChannel::enable()
+  // ====================
+  // Set Enable Request Register (DMA_SERQ). Enable DMA for the specified channel 
+  DMA_SERQ = channel;
+
+  I2S1_RCSR |= I2S_RCSR_RE | I2S_RCSR_BCE;
+  I2S1_TCSR = I2S_TCSR_TE | I2S_TCSR_BCE | I2S_TCSR_FRDE;
+
+  // DMAChannel::attachInterrupt()
+  // =============================
+  
   // Install the interrupt handler
   //
   // _VectorsRam is created by the Teensy library and it has been initialized
@@ -382,62 +393,9 @@ void setup() {
   _VectorsRam[16 + IRQ_DMA_CH0 + channel] = tx_dma_isr_function;
   NVIC_ENABLE_IRQ(IRQ_DMA_CH0 + channel);
 
-  // Enable the system-level interrupt for I2S
-  //NVIC_ENABLE_IRQ(IRQ_I2S0_TX);
-  //NVIC_ENABLE_IRQ(IRQ_I2S0_RX);
-
-  // ------ Final Enable -------------------------------------------------------
-  
-  // Set Enable Request Register (DMA_SERQ). Enable DMA for the specified channel 
-  DMA_SERQ = channel;
-
-  // Software reset
-  I2S0_TCSR = I2S_TCSR_SR;
-  //I2S0_RCSR = I2S_RCSR_SR;
-
-  // Transmit enabled | Bit clock enabled | FIFO request DMA enable
-  I2S0_TCSR = I2S_TCSR_TE | I2S_TCSR_BCE | I2S_TCSR_FRDE;
-  // Receive enabled | FIFO request DMA enable
-  //I2S0_RCSR = I2S_RCSR_RE | I2S_RCSR_FRDE;
-
   Serial.println("setup() done");
 }
 
-/*
- * Utility function that looks at the read/write pointers on the 
- * FIFO to determine if it is completely full yet.  The FIFO
- * pointers are 3-bit values.
- */
-bool isTXFIFOFull() {
-    // Read the FIFO pointers
-    uint32_t v = I2S0_TFR0;
-    uint32_t wfp = (v & 0b11110000000000000000) >> 16;
-    uint32_t rfp = (v & 0b1111);
-    // Full happens when the pointers are the same except for the MSB.
-    if ((wfp & 0b111) == (rfp & 0b111) && wfp != rfp) {
-      return true;
-    } else {
-      return false;
-    }
-}
-
-/*
- * Utility function that looks at the read/write pointers on the 
- * FIFO to determine if it is completely full yet.  The FIFO
- * pointers are 3-bit values.
- */
-bool isRXFIFOEmpty() {
-    // Read the FIFO pointers
-    uint32_t v = I2S0_RFR0;
-    uint32_t wfp = (v & 0b11110000000000000000) >> 16;
-    uint32_t rfp = (v & 0b1111);
-    // Empty happens when the pointers are the same.
-    if (wfp == rfp) {
-      return true;
-    } else {
-      return false;
-    }
-}
 /*            
               INV       (INV + 1) & 0b111
               ---       -----------------             
@@ -455,30 +413,14 @@ volatile bool isRightWrite = false;
 volatile int maxSize = 0;
 volatile int counter = 0;
 
-// This gets called whenever the FIFO interupt is raised
-void i2s0_tx_isr(void) {
-  cli();
-  // Replenish the FIFO as quickly as possible
-  //tryWrite();
-  sei();
-}
-
-// This gets called whenever the FIFO interupt is raised
-void i2s0_rx_isr(void) {
-  cli();
-  // Empty the FIFO as quickly as possible
-  //tryRead();
-  sei();
-}
-
 volatile long lastDisplay = 0;
 
 void loop() {
-  if (millis() - lastDisplay > 250) {
+  if (millis() - lastDisplay > 1000) {
     lastDisplay = millis();
-    //Serial.print(v);
-    //Serial.print(" ");
-    //Serial.print(firstHalf);
-    //Serial.println();
+    Serial.print(v);
+    Serial.print(" ");
+    Serial.print(firstHalf);
+    Serial.println();
   }
 }
