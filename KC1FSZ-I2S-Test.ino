@@ -12,7 +12,42 @@
 //
 #include <Audio.h>
 
-#include "utility/imxrt_hw.h"
+//#include "utility/imxrt_hw.h"
+
+/**
+13.6.1.3.4 Audio PLL (PLL4)
+The audio PLL synthesize a low jitter clock from a 24 MHz reference clock. The clock
+output frequency range for this PLL is from 650 MHz to 1.3 GHz. It has a Fractional-N
+synthesizer.
+
+There are /1, /2, /4 post dividers for the Audio PLL. The output frequency can be set by
+programming the fields in the CCM_ANALOG_PLL_AUDIO, and CCM_ANALOG_MISC2 register sets according 
+to the following equation: 
+
+PLL output frequency = Fref * (DIV_SELECT + NUM / DENOM)
+ */
+PROGMEM
+void set_audioClock2(int nfact, int32_t nmult, uint32_t ndiv, bool force = false) // sets PLL4
+{
+  if (!force && (CCM_ANALOG_PLL_AUDIO & CCM_ANALOG_PLL_AUDIO_ENABLE)) return;
+
+  CCM_ANALOG_PLL_AUDIO = CCM_ANALOG_PLL_AUDIO_BYPASS | CCM_ANALOG_PLL_AUDIO_ENABLE
+           | CCM_ANALOG_PLL_AUDIO_POST_DIV_SELECT(2) // 2: 1/4; 1: 1/2; 0: 1/1
+           | CCM_ANALOG_PLL_AUDIO_DIV_SELECT(nfact);
+
+  CCM_ANALOG_PLL_AUDIO_NUM   = nmult & CCM_ANALOG_PLL_AUDIO_NUM_MASK;
+  CCM_ANALOG_PLL_AUDIO_DENOM = ndiv & CCM_ANALOG_PLL_AUDIO_DENOM_MASK;
+  
+  CCM_ANALOG_PLL_AUDIO &= ~CCM_ANALOG_PLL_AUDIO_POWERDOWN;//Switch on PLL
+  while (!(CCM_ANALOG_PLL_AUDIO & CCM_ANALOG_PLL_AUDIO_LOCK)) {}; //Wait for pll-lock
+  
+  const int div_post_pll = 1; // other values: 2,4
+  CCM_ANALOG_MISC2 &= ~(CCM_ANALOG_MISC2_DIV_MSB | CCM_ANALOG_MISC2_DIV_LSB);
+  if(div_post_pll>1) CCM_ANALOG_MISC2 |= CCM_ANALOG_MISC2_DIV_LSB;
+  if(div_post_pll>3) CCM_ANALOG_MISC2 |= CCM_ANALOG_MISC2_DIV_MSB;
+  
+  CCM_ANALOG_PLL_AUDIO &= ~CCM_ANALOG_PLL_AUDIO_BYPASS;//Disable Bypass
+}
 
 AudioControlSGTL5000  sgtl5000_1;
 
@@ -33,15 +68,11 @@ const int SinLutFullScale = FullScale;
 int SinLut[LutSize];
 
 void BuildLut() {
-  Serial.println(FullScale);
   // Build the look-up table.  This will only cover the first 90 
   // degrees of the sin() function.
   for (unsigned int i = 0; i < LutSize; i++) {
     float rad = ((float)i / (float)PhaseRange) * 2.0 * 3.1415926;
     SinLut[i] = sin(rad) * FullScale;
-    Serial.print(i);
-    Serial.print(" ");
-    Serial.println(SinLut[i]);
   }  
 }
 
@@ -161,19 +192,21 @@ struct __attribute__((packed, aligned(4))) TCD {
 };
 
 volatile long v = 0;
+volatile long v1 = 0;
 volatile bool firstHalf = false;
 
 const unsigned int ToneFreqHz = 2000;
 const unsigned int PhaseStep = ToneFreqHz * PhaseRange / SampleFreqHz;
 unsigned int PhasePtr = 0;
+uint8_t channel = 0;
 
 // Interrupt service routine from DMA controller
 void tx_dma_isr_function(void) {  
 
-  int channel = 0;
   struct TCD* tcd = (struct TCD*)(0x400E9000 + 32 * channel); 
-  uint32_t* saddr = (uint32_t*)tcd->SADDR;
+  uint32_t saddr = (uint32_t)tcd->SADDR;
   v++;
+  v1++;
  
   // The INT register provides a bit map for the 16 channels signaling the presence of an
   // interrupt request for each channel. Depending on the appropriate bit setting in the
@@ -191,13 +224,16 @@ void tx_dma_isr_function(void) {
   // the DMA is working on the first half of the buffer then the new data should
   // be flowed into the second half.
   int startPtr = 0;
-  if (saddr < i2s_tx_buffer + (tx_buffer_size / 2)) {
-    startPtr = (tx_buffer_size / 2);
+  if (saddr < (uint32_t)i2s_tx_buffer + sizeof(i2s_tx_buffer) / 2) {
+    startPtr = sizeof(i2s_tx_buffer) / 2;
+    firstHalf = true;
+  } else {
+    firstHalf = false;
   }
 
   // We will be populating half of the buffer, depending on where the DMA channel
   // is working.  Notice also that we are only dealing with one side L/R.
-  
+  /*
   for (unsigned int i = 0; i < (tx_buffer_size / 2); i++) {
     
     // Cycle through the phase
@@ -210,7 +246,8 @@ void tx_dma_isr_function(void) {
     int v = SineWithQuadrant(PhasePtr);
     // We need to shift the data up to the high side of the 32-bit word
     i2s_tx_buffer[startPtr + i] = (v << 16);
-  }  
+  }
+  */  
 }
 
 void setup() {
@@ -223,9 +260,9 @@ void setup() {
   BuildLut();
 
   // Fill the transmit area
-  //for (int i = 0; i < tx_buffer_size; i++) {
-  //  i2s_tx_buffer[i] = (i * 2 + 1) << 16 | i * 2;
-  //}
+  for (int i = 0; i < tx_buffer_size; i++) {
+    i2s_tx_buffer[i] = (i * 2 + 1) << 16 | i * 2;
+  }
 
   sgtl5000_1.enable();
   sgtl5000_1.volume(1.0);
@@ -238,7 +275,6 @@ void setup() {
   __disable_irq();
 
   // Decide which channel to use
-  uint8_t channel = 0;
   uint32_t ch = 0;
   
   __enable_irq();
@@ -246,8 +282,11 @@ void setup() {
   channel = ch;
 
   // Clock control
+  // Clock Gating Register 5 - Enable DMA clock
   CCM_CCGR5 |= CCM_CCGR5_DMA(CCM_CCGR_ON);
 
+  // DMA control register
+  // Group 1 priority, minor loop enabled, debug enabled
   DMA_CR = DMA_CR_GRP1PRI | DMA_CR_EMLM | DMA_CR_EDBG;
   DMA_CERQ = ch;
   DMA_CERR = ch;
@@ -267,21 +306,20 @@ void setup() {
   // Enable clock for SAI1 module
   CCM_CCGR5 |= CCM_CCGR5_SAI1(CCM_CCGR_ON);
 
-  // TODO: AUDIO_SAMPLE_RATE_EXACT
-  int fs = 44100;
+  int fs = 44100.0;
   // PLL between 27*24 = 648 MHz and 54*24=1296 MHz
   // SAI prescaler 4 => (n1*n2) = multiple of 4
   int n1 = 4;
-  int n2 = 1 + (24000000 * 27) / (fs + 256 * n1);
+  int n2 = 1 + (24000000 * 27) / (fs * 256 * n1);
   double C = ((double)fs * 256 * n1 * n2) / 24000000;
   int c0 = C;
   int c2 = 10000;
   int c1 = C * c2 - (c0 * c2);
-  // TODO: UNDERSTAND THIS
-  set_audioClock(c0,c1,c2);
+  set_audioClock2(c0,c1,c2);
 
   // clear SAI1_CLK register locations
-  // &0x03 // (0,1,2): PLL3PFD0, PLL5, PLL4
+  // &0x03 
+  // (0,1,2): PLL3PFD0, PLL5, PLL4
   CCM_CSCMR1 = (CCM_CSCMR1 & ~(CCM_CSCMR1_SAI1_CLK_SEL_MASK))
        | CCM_CSCMR1_SAI1_CLK_SEL(2); 
   CCM_CS1CDR = (CCM_CS1CDR & ~(CCM_CS1CDR_SAI1_CLK_PRED_MASK | CCM_CS1CDR_SAI1_CLK_PODF_MASK))
@@ -306,7 +344,7 @@ void setup() {
   // Set the high water mark for the FIFO.  This determines when the interupt
   // needs to fire.
   I2S1_TCR1 = I2S_TCR1_RFW(1);
-  I2S1_TCR2 = I2S_TCR2_SYNC(tsync) | I2S_TCR2_BCP // sync=0; tx is async;
+  I2S1_TCR2 = I2S_TCR2_SYNC(tsync) | I2S_TCR2_BCP 
         | (I2S_TCR2_BCD | I2S_TCR2_DIV((1)) | I2S_TCR2_MSEL(1));
   I2S1_TCR3 = I2S_TCR3_TCE;
   I2S1_TCR4 = I2S_TCR4_FRSZ((2-1)) | I2S_TCR4_SYWD((32-1)) | I2S_TCR4_MF
@@ -419,8 +457,11 @@ void loop() {
   if (millis() - lastDisplay > 1000) {
     lastDisplay = millis();
     Serial.print(v);
-    Serial.print(" ");
+    Serial.print("\t");
+    Serial.print(v1);
+    Serial.print("\t");
     Serial.print(firstHalf);
     Serial.println();
+    v1 = 0;
   }
 }
