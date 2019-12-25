@@ -237,22 +237,14 @@ void tx_dma_isr_function(void) {
     }
     // Get the sine function from the lookup
     int s = SineWithQuadrant(PhasePtr);
-    v++;
+    // Ramp function
+    v += 100;
+
     // We need to shift the data up to the high side of the 32-bit word
-    //uint32_t s_left = (s & 0xffff) << 16;
-    //uint32_t s_left = 0;
-    //uint32_t s_right = (v & 0xffff);
-    uint32_t s_right = 0;
-    //uint32_t s_left = (v & 0x0000ffff) << 16;
-    uint32_t s_left;
-    
-    if (firstHalf)
-      s_left = 0x55550000;
-    else 
-      s_left = 0xaaaa0000;
+    uint32_t s_left = (s & 0xffff) << 16;
+    uint32_t s_right = (v & 0xffff);
     
     i2s_tx_buffer[startPtr + i] = s_left | s_right;
-    //i2s_tx_buffer[startPtr + i] = (v << 16) & 0xffff0000;
   }
 
   // Needed to allow DMA to see data  
@@ -264,17 +256,9 @@ void setup() {
   Serial.begin(115200);
   delay(3000);
   Serial.println("KC1FSZ");
-  Serial.println(sizeof(i2s_tx_buffer));
 
   // Builds the SINE/4 look-up table
   BuildLut();
-
-  // Fill the transmit area
-  //for (uint32_t i = 0; i < tx_buffer_size; i++) {
-  //  i2s_tx_buffer[i] = (i * 2 + 1) << 16 | i * 2;
-  //}
-  // Needed to allow DMA to see data  
-  //arm_dcache_flush_delete(i2s_tx_buffer,sizeof(i2s_tx_buffer));
 
   sgtl5000_1.enable();
   sgtl5000_1.volume(1.0);
