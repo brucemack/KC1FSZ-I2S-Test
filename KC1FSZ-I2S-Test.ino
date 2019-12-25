@@ -12,8 +12,6 @@
 //
 #include <Audio.h>
 
-//#include "utility/imxrt_hw.h"
-
 /**
 13.6.1.3.4 Audio PLL (PLL4)
 The audio PLL synthesize a low jitter clock from a 24 MHz reference clock. The clock
@@ -191,13 +189,12 @@ struct __attribute__((packed, aligned(4))) TCD {
   };
 };
 
-volatile long v = 0;
-volatile long v1 = 0;
+volatile uint32_t v = 0;
 volatile bool firstHalf = false;
+volatile uint32_t PhasePtr = 0;
 
 const unsigned int ToneFreqHz = 2000;
 const unsigned int PhaseStep = ToneFreqHz * PhaseRange / SampleFreqHz;
-unsigned int PhasePtr = 0;
 uint8_t channel = 0;
 
 // Interrupt service routine from DMA controller
@@ -205,8 +202,6 @@ void tx_dma_isr_function(void) {
 
   struct TCD* tcd = (struct TCD*)(0x400E9000 + 32 * channel); 
   uint32_t saddr = (uint32_t)tcd->SADDR;
-  v++;
-  v1++;
  
   // The INT register provides a bit map for the 16 channels signaling the presence of an
   // interrupt request for each channel. Depending on the appropriate bit setting in the
@@ -225,7 +220,7 @@ void tx_dma_isr_function(void) {
   // be flowed into the second half.
   int startPtr = 0;
   if (saddr < (uint32_t)i2s_tx_buffer + sizeof(i2s_tx_buffer) / 2) {
-    startPtr = sizeof(i2s_tx_buffer) / 2;
+    startPtr = tx_buffer_size / 2;
     firstHalf = true;
   } else {
     firstHalf = false;
@@ -233,9 +228,7 @@ void tx_dma_isr_function(void) {
 
   // We will be populating half of the buffer, depending on where the DMA channel
   // is working.  Notice also that we are only dealing with one side L/R.
-  /*
   for (unsigned int i = 0; i < (tx_buffer_size / 2); i++) {
-    
     // Cycle through the phase
     PhasePtr += PhaseStep;
     // Wrap the phase pointer if needed
@@ -243,11 +236,27 @@ void tx_dma_isr_function(void) {
       PhasePtr -= PhaseRange; 
     }
     // Get the sine function from the lookup
-    int v = SineWithQuadrant(PhasePtr);
+    int s = SineWithQuadrant(PhasePtr);
+    v++;
     // We need to shift the data up to the high side of the 32-bit word
-    i2s_tx_buffer[startPtr + i] = (v << 16);
+    //uint32_t s_left = (s & 0xffff) << 16;
+    //uint32_t s_left = 0;
+    //uint32_t s_right = (v & 0xffff);
+    uint32_t s_right = 0;
+    //uint32_t s_left = (v & 0x0000ffff) << 16;
+    uint32_t s_left;
+    
+    if (firstHalf)
+      s_left = 0x55550000;
+    else 
+      s_left = 0xaaaa0000;
+    
+    i2s_tx_buffer[startPtr + i] = s_left | s_right;
+    //i2s_tx_buffer[startPtr + i] = (v << 16) & 0xffff0000;
   }
-  */  
+
+  // Needed to allow DMA to see data  
+  arm_dcache_flush_delete(&(i2s_tx_buffer[startPtr]),sizeof(i2s_tx_buffer) / 2);
 }
 
 void setup() {
@@ -255,14 +264,17 @@ void setup() {
   Serial.begin(115200);
   delay(3000);
   Serial.println("KC1FSZ");
+  Serial.println(sizeof(i2s_tx_buffer));
 
   // Builds the SINE/4 look-up table
   BuildLut();
 
   // Fill the transmit area
-  for (int i = 0; i < tx_buffer_size; i++) {
-    i2s_tx_buffer[i] = (i * 2 + 1) << 16 | i * 2;
-  }
+  //for (uint32_t i = 0; i < tx_buffer_size; i++) {
+  //  i2s_tx_buffer[i] = (i * 2 + 1) << 16 | i * 2;
+  //}
+  // Needed to allow DMA to see data  
+  //arm_dcache_flush_delete(i2s_tx_buffer,sizeof(i2s_tx_buffer));
 
   sgtl5000_1.enable();
   sgtl5000_1.volume(1.0);
@@ -361,7 +373,7 @@ void setup() {
         | I2S_RCR4_FSE | I2S_RCR4_FSP | I2S_RCR4_FSD;
   I2S1_RCR5 = I2S_RCR5_WNW((32-1)) | I2S_RCR5_W0W((32-1)) | I2S_RCR5_FBT((32-1));
 
-  CORE_PIN7_CONFIG = 3; //1:TX_DATA0
+  CORE_PIN7_CONFIG = 3; // 1:TX_DATA0
 
   // ----- Configure DMA -------------------------------------------------------
 
@@ -457,11 +469,6 @@ void loop() {
   if (millis() - lastDisplay > 1000) {
     lastDisplay = millis();
     Serial.print(v);
-    Serial.print("\t");
-    Serial.print(v1);
-    Serial.print("\t");
-    Serial.print(firstHalf);
     Serial.println();
-    v1 = 0;
   }
 }
