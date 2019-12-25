@@ -119,19 +119,10 @@ unsigned int GetPhase(unsigned int counter,unsigned int freqHz) {
   return i;
 }
 
-// Clocking calculations for 44.1K using 96 Mhz system clock
-//
-// MCLK needs to 256 * 44.100 kHz sample rate = 11.2896 MHz
-// This is given by (CPU frequency * MCLK_MULT) / MCLK_DIV
-// MCLK_MULT is a positive integer with range 1-256 (8 bits)
-// MCLK_DIV is a positive integer with range 1-4096 (12 bits)
-// MCLK_MULT must be <= MCLK_DIV
-//
-//#define MCLK_MULT 2
-//#define MCLK_DIVIDE 17
+uint8_t channel = 0;
 
 // This is the size of the buffer used for DMA transmit operations
-const int tx_buffer_size = 128;
+const unsigned int tx_buffer_size = 128;
 
 // Create the buffer from which DMA transmit operations will happen.
 //
@@ -142,7 +133,7 @@ const int tx_buffer_size = 128;
 // region of memory in the same clock cycle.
 DMAMEM __attribute__((aligned(32))) static uint32_t i2s_tx_buffer[tx_buffer_size];
 
-// This structure matches the layout of the K20 DMA Transfer Control Descriptor
+// This structure matches the layout of the DMA Transfer Control Descriptor
 //
 // Address: 4000_8000h base + 1000h offset + (32d × i), where i=0d to 15d
 //
@@ -189,17 +180,39 @@ struct __attribute__((packed, aligned(4))) TCD {
   };
 };
 
-volatile uint32_t v = 0;
-volatile bool firstHalf = false;
-volatile uint32_t PhasePtr = 0;
-
 const unsigned int ToneFreqHz = 2000;
 const unsigned int PhaseStep = ToneFreqHz * PhaseRange / SampleFreqHz;
-uint8_t channel = 0;
+
+volatile uint32_t V = 0;
+volatile uint32_t PhasePtr = 0;
+
+// This is where we actually generate the transmit data.
+//
+void make_tx_data(uint32_t txBuffer[],unsigned int txBufferSize) {  
+  // We will be populating half of the buffer, depending on where the DMA channel
+  // is working.  Notice also that we are only dealing with one side L/R.
+  for (unsigned int i = 0; i < txBufferSize; i++) {
+    // Cycle through the phase
+    PhasePtr += PhaseStep;
+    // Wrap the phase pointer if needed
+    while (PhasePtr >= PhaseRange) {
+      PhasePtr -= PhaseRange; 
+    }
+    // Get the sine function from the lookup
+    int s = SineWithQuadrant(PhasePtr);
+    // Ramp function
+    V += 100;
+    // We need to shift the data up to the high side of the 32-bit word
+    uint32_t s_left = (s & 0xffff) << 16;
+    uint32_t s_right = (V & 0xffff);
+    
+    txBuffer[i] = s_left | s_right;
+  }
+}
 
 // Interrupt service routine from DMA controller
 void tx_dma_isr_function(void) {  
-
+  
   struct TCD* tcd = (struct TCD*)(0x400E9000 + 32 * channel); 
   uint32_t saddr = (uint32_t)tcd->SADDR;
  
@@ -218,35 +231,15 @@ void tx_dma_isr_function(void) {
   // Check to see what part of the TX buffer the DMA channel is working on.  If 
   // the DMA is working on the first half of the buffer then the new data should
   // be flowed into the second half.
-  int startPtr = 0;
+  int startPtr;
   if (saddr < (uint32_t)i2s_tx_buffer + sizeof(i2s_tx_buffer) / 2) {
     startPtr = tx_buffer_size / 2;
-    firstHalf = true;
   } else {
-    firstHalf = false;
+    startPtr = 0;
   }
 
-  // We will be populating half of the buffer, depending on where the DMA channel
-  // is working.  Notice also that we are only dealing with one side L/R.
-  for (unsigned int i = 0; i < (tx_buffer_size / 2); i++) {
-    // Cycle through the phase
-    PhasePtr += PhaseStep;
-    // Wrap the phase pointer if needed
-    while (PhasePtr >= PhaseRange) {
-      PhasePtr -= PhaseRange; 
-    }
-    // Get the sine function from the lookup
-    int s = SineWithQuadrant(PhasePtr);
-    // Ramp function
-    v += 100;
-
-    // We need to shift the data up to the high side of the 32-bit word
-    uint32_t s_left = (s & 0xffff) << 16;
-    uint32_t s_right = (v & 0xffff);
-    
-    i2s_tx_buffer[startPtr + i] = s_left | s_right;
-  }
-
+  // Request to generate a block of data
+  make_tx_data(&(i2s_tx_buffer[startPtr]),tx_buffer_size / 2);
   // Needed to allow DMA to see data  
   arm_dcache_flush_delete(&(i2s_tx_buffer[startPtr]),sizeof(i2s_tx_buffer) / 2);
 }
@@ -254,7 +247,7 @@ void tx_dma_isr_function(void) {
 void setup() {
 
   Serial.begin(115200);
-  delay(3000);
+  delay(1000);
   Serial.println("KC1FSZ");
 
   // Builds the SINE/4 look-up table
@@ -442,17 +435,11 @@ void setup() {
   110  -2     001 + 1 = 010 ->  2
   111  -1     000 + 1 = 001 ->  1
 */
-volatile bool isRightRead = false;
-volatile bool isRightWrite = false;
-volatile int maxSize = 0;
-volatile int counter = 0;
 
 volatile long lastDisplay = 0;
 
 void loop() {
   if (millis() - lastDisplay > 1000) {
     lastDisplay = millis();
-    Serial.print(v);
-    Serial.println();
   }
 }
