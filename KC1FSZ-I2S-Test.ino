@@ -187,6 +187,7 @@ const unsigned int ToneFreqHz = 2000;
 const unsigned int PhaseStep = ToneFreqHz * PhaseRange / SampleFreqHz;
 
 volatile uint32_t V = 0;
+volatile uint32_t RV = 0;
 volatile uint32_t PhasePtr = 0;
 
 // This is where we actually generate the transmit data.
@@ -214,6 +215,7 @@ void make_tx_data(uint32_t txBuffer[],unsigned int txBufferSize) {
 }
 
 void consume_rx_data(uint32_t rxBuffer[],unsigned int rxBufferSize) {  
+  RV++;
 }
 
 // Interrupt service routine from DMA controller
@@ -255,7 +257,7 @@ void rx_dma_isr_function(void) {
   
   struct TCD* tcd = (struct TCD*)(0x400E9000 + 32 * RX_DMA_Channel); 
   uint32_t daddr = (uint32_t)tcd->DADDR;
-   
+
   // Clear interrupt request for channel
   DMA_CINT = RX_DMA_Channel;
 
@@ -282,9 +284,6 @@ void setup() {
   // Builds the SIN/4 look-up table
   BuildLut();
 
-  sgtl5000_1.enable();
-  sgtl5000_1.volume(1.0);
-
   // ----- Enable DMA ----------------------------------------------------
   //
   // DMAChannel.begin()
@@ -294,10 +293,8 @@ void setup() {
 
   // Decide which channels to use
   uint32_t tx_ch = 0;
-  uint32_t rx_ch = 0;
+  uint32_t rx_ch = 1;
   
-  __enable_irq();
-
   TX_DMA_Channel = tx_ch;
 
   // Clock control
@@ -452,25 +449,40 @@ void setup() {
 
   // ========================================================================
   // Receive Setup
-
+  
+  // DMAChannel::begin() 
   RX_DMA_Channel = rx_ch;
+  
+  // Clock control
+  // Clock Gating Register 5 - Enable DMA clock
+  CCM_CCGR5 |= CCM_CCGR5_DMA(CCM_CCGR_ON);
+
+  // DMA control register
+  // Group 1 priority, minor loop enabled, debug enabled
+  DMA_CR = DMA_CR_GRP1PRI | DMA_CR_EMLM | DMA_CR_EDBG;  
   
   DMA_CERQ = rx_ch;
   DMA_CERR = rx_ch;
   DMA_CEEI = rx_ch;
   DMA_CINT = rx_ch;
-
+  
   // Establish pointer to control structure
   tcd = (struct TCD*)(0x400E9000 + rx_ch * 32); 
   // Clear 
   p = (uint32_t*)tcd;
   for (int i = 0; i < 8; i++)
     *p++ = 0;
+  
+  // -----------------------
+  // AudioOutputI2S::begin()
 
+  // (DMAChannel.begin() - see above)
+  // (AudioOutputI2S::config_i2s() - see above)
+  
   // RX_DATA0
   CORE_PIN8_CONFIG = 3;  
-  IOMUXC_SAI1_RX_DATA0_SELECT_INPUT = 1;
-
+  IOMUXC_SAI1_RX_DATA0_SELECT_INPUT = 2;
+  
   // Source address is the high side of the receive buffer
   tcd->SADDR = (void*)((uint32_t)&I2S1_RDR0 + 2);
   tcd->SOFF = 0;
@@ -488,7 +500,7 @@ void setup() {
   tcd->BITER_ELINKNO = sizeof(i2s_rx_buffer) / 2;
   // Generate interrupt when major counter completes
   tcd->CSR = DMA_TCD_CSR_INTHALF | DMA_TCD_CSR_INTMAJOR;
-
+  
   // DMAChannel::triggerAtHardwareEvent()
   // ====================================
 
@@ -497,9 +509,9 @@ void setup() {
   mux = &DMAMUX_CHCFG0 + RX_DMA_Channel;
   *mux = 0;
   *mux = (source & 0x7F) | DMAMUX_CHCFG_ENBL;
-
+  
   I2S1_RCSR = I2S_RCSR_RE | I2S_RCSR_BCE | I2S_RCSR_FRDE | I2S_RCSR_FR;
-
+  
   // DMAChannel::enable()
   // ====================
   // Set Enable Request Register (DMA_SERQ). Enable DMA for the specified channel.
@@ -509,7 +521,14 @@ void setup() {
   // =============================
   _VectorsRam[16 + IRQ_DMA_CH0 + RX_DMA_Channel] = rx_dma_isr_function;
   NVIC_ENABLE_IRQ(IRQ_DMA_CH0 + RX_DMA_Channel);
-
+  
+  __enable_irq();
+  
+  delay(1000);
+  
+  sgtl5000_1.enable();
+  sgtl5000_1.volume(1.0);
+  
   Serial.println("setup() done");
 }
 
@@ -531,5 +550,6 @@ volatile long lastDisplay = 0;
 void loop() {
   if (millis() - lastDisplay > 1000) {
     lastDisplay = millis();
+    Serial.println(RV);
   }
 }
